@@ -6,12 +6,8 @@ from functools import partial
 # os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 sys.path.extend(['/mnt/data/edw_2'])
-import tensorflow as tf
 
-# Disable GPU to avoid consuming memory JAX will need later
-tf.config.set_visible_devices([], 'GPU')
-
-from datasets import DatasetDict, concatenate_datasets, load_dataset
+from datasets import DatasetDict, Sequence, Value, concatenate_datasets, load_dataset
 from transformers import AutoTokenizer
 from config import config
 
@@ -67,11 +63,11 @@ def main():
 
         return bool(en_text) and bool(vi_text) and str(en_text).strip() != "" and str(vi_text).strip() != ""
 
-    def cast_dtypes(features):
-        features['input_ids'] = tf.cast(features['input_ids'], tf.int32)
-        features['attention_mask'] = tf.cast(features['attention_mask'], tf.int32)
-        features['labels'] = tf.cast(features['labels'], tf.int32)
-        return features
+    def cast_int32(ds):
+        feats = ds.features.copy()
+        for col in ("input_ids", "attention_mask", "labels"):
+            feats[col] = Sequence(Value("int32"), length=config.train_max_length_input)
+        return ds.cast(feats)
 
     for split_name, split_key in splits.items():
         if split_key not in dataset:
@@ -110,37 +106,27 @@ def main():
                 suffix = "en_vi" if "en-vi" in direction_tag else "vi_en"
                 print(f"\n✅ TOTAL {split_name.upper()} RECORDS ({suffix.upper()}): \033[92m{len(single_direction_ds):,}\033[0m")
 
-                tfds = single_direction_ds.to_tf_dataset(
-                    columns=["input_ids", "attention_mask", "labels"],
-                    shuffle=False,
-                    batch_size=config.eval_batch_size,
-                    drop_remainder=False,
-                    num_workers=32,
-                )
-                tfds = tfds.map(cast_dtypes, num_parallel_calls=tf.data.AUTOTUNE)
+                single_direction_ds = single_direction_ds.select_columns(
+                    ["input_ids", "attention_mask", "labels"])
+                single_direction_ds = cast_int32(single_direction_ds)
 
-                save_path = f"{config.tfds_path.as_posix()}_{split_name}_{suffix}"
-                print(f"💾 Saving {split_name.upper()} ({suffix.upper()}) TFDS to {save_path}")
-                tfds.save(save_path)
+                save_path = f"{config.dataset_path.as_posix()}_{split_name}_{suffix}"
+                print(f"💾 Saving {split_name.upper()} ({suffix.upper()}) HF Arrow to {save_path}")
+                single_direction_ds.save_to_disk(save_path)
 
         else:
-            # Training set remains perfectly mixed and shuffled
+            # Training set: one row = one example. Grain shuffles/batches at runtime.
             merged_dataset = concatenate_datasets(list(combined.values()))
             total_records = len(merged_dataset)
             print(f"\n🚀 TOTAL {split_name.upper()} RECORDS (Both Directions Mixed): \033[92m{total_records:,}\033[0m")
 
-            tfds = merged_dataset.to_tf_dataset(
-                columns=["input_ids", "attention_mask", "labels"],
-                shuffle=True,
-                batch_size=config.compress_batch,
-                drop_remainder=True,
-                num_workers=32,
-            )
-            tfds = tfds.map(cast_dtypes, num_parallel_calls=tf.data.AUTOTUNE)
+            merged_dataset = merged_dataset.select_columns(
+                ["input_ids", "attention_mask", "labels"])
+            merged_dataset = cast_int32(merged_dataset)
 
-            save_path = f"{config.tfds_path.as_posix()}_{split_name}"
-            print(f"💾 Saving {split_name.upper()} TFDS to {save_path}")
-            tfds.save(save_path)
+            save_path = f"{config.dataset_path.as_posix()}_{split_name}"
+            print(f"💾 Saving {split_name.upper()} HF Arrow to {save_path}")
+            merged_dataset.save_to_disk(save_path)
 
     print("\n✅ Benchmark Data preprocessing complete!")
 

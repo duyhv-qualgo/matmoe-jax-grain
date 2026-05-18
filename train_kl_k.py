@@ -6,7 +6,7 @@ import threading
 from typing import Any
 import sacrebleu
 
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.985"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.75")
 sys.path.extend(['/mnt/data/edw_2'])
 
 import jax
@@ -19,6 +19,9 @@ import numpy as np
 from transformers import AutoTokenizer
 from tqdm import tqdm
 import orbax.checkpoint as ocp
+import msgpack
+import grain
+from datasets import load_from_disk
 
 from config import config, MoEModelConfig
 from moe_model_dynamic_k import MoETranslationModel
@@ -61,27 +64,36 @@ def main():
     )
 
     print(f"\n{'-' * 60}\n 💾 --- DATA PIPELINE --- \n{'-' * 60}")
-    print(f"[\033[94mData\033[0m] Loading TFDS splits from base: \033[93m{config.tfds_path}\033[0m")
+    print(f"[\033[94mData\033[0m] Loading HF Arrow splits from base: \033[93m{config.dataset_path}\033[0m")
 
-    train_ds = tf.data.Dataset.load(config.tfds_path.as_posix() + "_train") \
-        .rebatch(config.batch_size, drop_remainder=True) \
-        .batch(grad_accum_steps, drop_remainder=True) \
-        .cache().shuffle(10000).repeat().prefetch(tf.data.AUTOTUNE)
+    hf_train = load_from_disk(config.dataset_path.as_posix() + "_train").with_format("numpy")
+    train_ds = (
+        grain.MapDataset.source(hf_train)
+            .seed(config.seed)
+            .shuffle()
+            .repeat()
+            .batch(config.batch_size * grad_accum_steps, drop_remainder=True)
+            .to_iter_dataset(grain.ReadOptions(num_threads=16, prefetch_buffer_size=8))
+            .mp_prefetch(grain.MultiprocessingOptions(num_workers=2))
+    )
 
-    eval_ds_en_vi = tf.data.Dataset.load(config.tfds_path.as_posix() + "_validation_en_vi") \
-        .rebatch(config.eval_batch_size, drop_remainder=False).cache().prefetch(tf.data.AUTOTUNE)
+    def make_eval_ds(base_path: str, batch_size: int):
+        hf = load_from_disk(base_path).with_format("numpy")
+        return (grain.MapDataset.source(hf)
+                  .batch(batch_size, drop_remainder=False)
+                  .to_iter_dataset(grain.ReadOptions(num_threads=4, prefetch_buffer_size=4)))
 
-    eval_ds_vi_en = tf.data.Dataset.load(config.tfds_path.as_posix() + "_validation_vi_en") \
-        .rebatch(config.eval_batch_size, drop_remainder=False).cache().prefetch(tf.data.AUTOTUNE)
-
-    test_ds_en_vi = tf.data.Dataset.load(config.tfds_path.as_posix() + "_test_en_vi") \
-        .rebatch(config.test_batch_size, drop_remainder=False).cache().prefetch(tf.data.AUTOTUNE)
-
-    test_ds_vi_en = tf.data.Dataset.load(config.tfds_path.as_posix() + "_test_vi_en") \
-        .rebatch(config.test_batch_size, drop_remainder=False).cache().prefetch(tf.data.AUTOTUNE)
+    eval_ds_en_vi = make_eval_ds(config.dataset_path.as_posix() + "_validation_en_vi", config.eval_batch_size)
+    eval_ds_vi_en = make_eval_ds(config.dataset_path.as_posix() + "_validation_vi_en", config.eval_batch_size)
+    test_ds_en_vi = make_eval_ds(config.dataset_path.as_posix() + "_test_en_vi", config.test_batch_size)
+    test_ds_vi_en = make_eval_ds(config.dataset_path.as_posix() + "_test_vi_en", config.test_batch_size)
 
     ds_iter = iter(train_ds)
-    
+
+    def to_macro(arr):
+        # [B*G, S] -> [G, B, S]
+        return arr.reshape(grad_accum_steps, config.batch_size, -1)
+
     steps_per_epoch = max(1, config.total_examples // (config.batch_size * grad_accum_steps))
 
     rngs = nnx.Rngs(config.seed)
@@ -158,6 +170,16 @@ def main():
     global_step = ckpt_manager.latest_step() or 0
     if global_step > 0:
         print(f"\n💾 [\033[93mCheckpoint\033[0m] Restoring from Update Step \033[92m{global_step}\033[0m...")
+
+        data_ckpt_path = config.checkpoint_path / f"data_iter_{global_step}.msgpack"
+        if data_ckpt_path.exists():
+            with open(data_ckpt_path, "rb") as f:
+                ds_iter.set_state(msgpack.unpackb(f.read(), raw=False))
+            ds_iter.start_prefetch()
+            print(f"💾 [\033[93mData\033[0m] Resumed iterator from {data_ckpt_path.name}")
+        else:
+            print(f"⚠️  No data_iter_{global_step}.msgpack — iterator restarts fresh")
+
         _, abstract_model_state = nnx.split(model)
         _, abstract_opt_state = nnx.split(optimizer)
         restored = ckpt_manager.restore(global_step, args=ocp.args.StandardRestore(
@@ -221,11 +243,9 @@ def main():
 
             logits1, aux_loss1, router_z_loss1 = m_model(c_source_ids, decoder_input, c_src_mask, tgt_mask,
                                                        current_mlp_dim=dim1, current_top_k=k1, deterministic=False)
-            logits1 = logits1.astype(jnp.float32)
 
             logits2, aux_loss2, router_z_loss2 = m_model(c_source_ids, decoder_input, c_src_mask, tgt_mask,
                                                        current_mlp_dim=dim2, current_top_k=k2, deterministic=False)
-            logits2 = logits2.astype(jnp.float32)
 
             loss_mask = (labels != model_config.pad_token_id).astype(jnp.float32)
 
@@ -313,7 +333,7 @@ def main():
         final_grads, final_loss, final_metrics, final_state = final_carry
 
         nnx.update(model, final_state)
-        optimizer.update(model, final_grads)
+        optimizer.update(final_grads)
         
         return final_loss, final_metrics
 
@@ -330,9 +350,9 @@ def main():
     print(f"\n🔥 [\033[93mWarmup\033[0m] Pre-compiling JIT kernels for dynamic training...")
     
     warmup_batch = next(ds_iter)
-    warmup_en = jax.device_put(warmup_batch['input_ids'].numpy(), train_dp_sharding)
-    warmup_mask = jax.device_put(warmup_batch['attention_mask'].numpy(), train_dp_sharding)
-    warmup_vi = jax.device_put(warmup_batch['labels'].numpy(), train_dp_sharding)
+    warmup_en = jax.device_put(to_macro(warmup_batch['input_ids']), train_dp_sharding)
+    warmup_mask = jax.device_put(to_macro(warmup_batch['attention_mask']), train_dp_sharding)
+    warmup_vi = jax.device_put(to_macro(warmup_batch['labels']), train_dp_sharding)
     
     # warmup_combinations = [(1024, 1024)]
     warmup_combinations = []
@@ -398,14 +418,25 @@ def main():
     print(f"  [\033[93mCurriculum\033[0m] Strict Warmup (k={config.top_k}): \033[96m{K_WARMUP_STEPS:,}\033[0m steps.")
     print(f"  [\033[93mCurriculum\033[0m] Linear Blending Transition: \033[96m{K_TRANSITION_STEPS:,}\033[0m steps.")
 
-    with tqdm(total=config.total_training_steps, initial=global_step, desc="MatMoE Training (Updates)", unit="upd") as pbar:
+    try:
+     # === BENCHMARK ACCUMULATORS (per log_interval window) ===
+     bench_t_data = 0.0
+     bench_t_h2d = 0.0
+     bench_t_step = 0.0
+     dataloader_name = "grain"
+     with tqdm(total=config.total_training_steps, initial=global_step, desc="MatMoE Training (Updates)", unit="upd") as pbar:
         while global_step < config.total_training_steps:
-            
-            batch = next(ds_iter)
 
-            sharded_en = jax.device_put(batch['input_ids'].numpy(), train_dp_sharding)
-            sharded_mask = jax.device_put(batch['attention_mask'].numpy(), train_dp_sharding)
-            sharded_vi = jax.device_put(batch['labels'].numpy(), train_dp_sharding)
+            _t0 = time.perf_counter()
+            batch = next(ds_iter)
+            _t1 = time.perf_counter()
+            bench_t_data += (_t1 - _t0)
+
+            sharded_en = jax.device_put(to_macro(batch['input_ids']), train_dp_sharding)
+            sharded_mask = jax.device_put(to_macro(batch['attention_mask']), train_dp_sharding)
+            sharded_vi = jax.device_put(to_macro(batch['labels']), train_dp_sharding)
+            _t2 = time.perf_counter()
+            bench_t_h2d += (_t2 - _t1)
 
             py_dim1, py_dim2 = random.sample(all_dims, k=2)
             
@@ -434,8 +465,12 @@ def main():
             k1_tensor = jnp.array(py_k1, dtype=jnp.int32)
             k2_tensor = jnp.array(py_k2, dtype=jnp.int32)
             
-            t_loss, metrics_array = macro_train_step(model, optimizer, sharded_en, sharded_mask, sharded_vi, 
+            _t3 = time.perf_counter()
+            t_loss, metrics_array = macro_train_step(model, optimizer, sharded_en, sharded_mask, sharded_vi,
                                                     py_dim1, py_dim2, k1_tensor, k2_tensor)
+            jax.block_until_ready(t_loss)
+            _t4 = time.perf_counter()
+            bench_t_step += (_t4 - _t3)
 
             global_step += 1
             pbar.update(1)
@@ -446,10 +481,24 @@ def main():
 
             if global_step % config.log_interval == 0:
                 current_time = time.time()
-                
+
                 samples_processed = config.batch_size * grad_accum_steps * config.log_interval
                 speed_samples = samples_processed / (current_time - last_time)
-                
+
+                # === BENCHMARK REPORT (avg ms per macro-step over the window) ===
+                _n = max(config.log_interval, 1)
+                ms_data = bench_t_data / _n * 1000
+                ms_h2d  = bench_t_h2d  / _n * 1000
+                ms_step = bench_t_step / _n * 1000
+                ms_total = ms_data + ms_h2d + ms_step
+                data_pct = (bench_t_data / max(bench_t_data + bench_t_h2d + bench_t_step, 1e-9)) * 100
+                print(f"\n[BENCH/{dataloader_name}] step={global_step} "
+                      f"t_data={ms_data:.1f}ms  t_h2d={ms_h2d:.1f}ms  t_step={ms_step:.1f}ms  "
+                      f"total={ms_total:.1f}ms  data_share={data_pct:.1f}%  sps={speed_samples:.0f}")
+                bench_t_data = 0.0
+                bench_t_h2d = 0.0
+                bench_t_step = 0.0
+
                 current_lr = float(lr_schedule(global_step))
                 current_epoch_float = global_step / steps_per_epoch
 
@@ -488,7 +537,7 @@ def main():
                 def run_eval_multi_dim(ds):
                     all_losses = []
                     for b in ds:
-                        in_np, mask_np, labels_np = b['input_ids'].numpy(), b['attention_mask'].numpy(), b['labels'].numpy()
+                        in_np, mask_np, labels_np = b['input_ids'], b['attention_mask'], b['labels']
                         actual_bsz = in_np.shape[0]
                         if actual_bsz < config.eval_batch_size:
                             pad_amt = config.eval_batch_size - actual_bsz
@@ -510,7 +559,7 @@ def main():
                     """Evaluate dim=1024 with all top-k values"""
                     all_losses = {k: [] for k in all_top_ks}
                     for b in ds:
-                        in_np, mask_np, labels_np = b['input_ids'].numpy(), b['attention_mask'].numpy(), b['labels'].numpy()
+                        in_np, mask_np, labels_np = b['input_ids'], b['attention_mask'], b['labels']
                         actual_bsz = in_np.shape[0]
                         if actual_bsz < config.eval_batch_size:
                             pad_amt = config.eval_batch_size - actual_bsz
@@ -603,8 +652,7 @@ def main():
 
                 def generate_test_set_multi_dim(ds, refs, is_en_vi=True):
                     for b_idx, b in enumerate(ds):
-                        in_np, mask_np, labels_np = b['input_ids'].numpy(), b['attention_mask'].numpy(), b[
-                            'labels'].numpy()
+                        in_np, mask_np, labels_np = b['input_ids'], b['attention_mask'], b['labels']
                         actual_bsz = in_np.shape[0]
 
                         if actual_bsz < config.test_batch_size:
@@ -634,8 +682,7 @@ def main():
                 def generate_test_set_dim_1024_topk(ds, is_en_vi=True):
                     """Generate predictions for dim=1024 with all top-k values"""
                     for b_idx, b in enumerate(ds):
-                        in_np, mask_np, labels_np = b['input_ids'].numpy(), b['attention_mask'].numpy(), b[
-                            'labels'].numpy()
+                        in_np, mask_np, labels_np = b['input_ids'], b['attention_mask'], b['labels']
                         actual_bsz = in_np.shape[0]
 
                         if actual_bsz < config.test_batch_size:
@@ -757,14 +804,27 @@ def main():
                 _, o_st = nnx.split(optimizer)
                 ckpt_manager.save(global_step, args=ocp.args.StandardSave({'model': m_st, 'opt': o_st}))
 
+                data_ckpt_path = config.checkpoint_path / f"data_iter_{global_step}.msgpack"
+                with open(data_ckpt_path, "wb") as f:
+                    f.write(msgpack.packb(ds_iter.get_state(), use_bin_type=True))
+
             if global_step % config.model_save_interval == 0:
                 _, model_params, _ = nnx.split(model, nnx.Param, ...)
 
-                def unwrap_state(x): return {k: unwrap_state(v) for k, v in x.items()} if hasattr(x, "items") else (
-                    x[...] if isinstance(x, nnx.Variable) else x)
+                def unwrap_state(x):
+                    if isinstance(x, (nnx.Variable, nnx.VariableState)):
+                        return x.value
+                    if hasattr(x, "items"):
+                        return {k: unwrap_state(v) for k, v in x.items()}
+                    return x
 
                 with open(config.latest_msg_path, "wb") as f: f.write(
                     flax.serialization.msgpack_serialize(unwrap_state(model_params)))
+    finally:
+        try:
+            ds_iter.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ class Config:
     seed: int = 42
 
     # --- Directory Allocation ---
-    artifact_root: Path = 'artifacts'
+    artifact_root: Path = Path('artifacts')
     material_dir: Path = field(init=False)
     training_artifact_dir: Path = field(init=False)
 
@@ -37,17 +37,16 @@ class Config:
     max_length_inference: int = 256
     lang_pair: str = 'en<->vi'
 
-    # --- TFDS Configuration ---
-    tfds_version: str = '2_0'
-    tfds_path: Path = field(init=False)
-    compress_batch: int = 2 ** 12
+    # --- Dataset Configuration (HF Arrow + Grain) ---
+    dataset_version: str = '2_0'
+    dataset_path: Path = field(init=False)
     total_examples: int = 5_955_998
 
     # =======================================================
     # 🌟 HARDWARE SCALE UP
     # =======================================================
     num_accelerator: int = 2  # 🚀 Upgraded to 8 GPUs
-    batch_size: int = 2 ** 10
+    batch_size: int = 2 ** 6
     eval_batch_size: int = 2 ** 10
     test_batch_size: int = 2 ** 10
     grad_accum_steps: int = 4
@@ -137,8 +136,8 @@ class Config:
         self.path_data = self.material_dir / 'data'
         self.tokenizer_path_ = self.material_dir / 'tokenizer'
 
-        tfds_name = f'tfds_{self.tfds_version}_{self.train_max_length_input}_{self.train_max_length_output}'
-        self.tfds_path = self.path_data / tfds_name
+        dataset_name = f'phomt_{self.dataset_version}_{self.train_max_length_input}_{self.train_max_length_output}'
+        self.dataset_path = self.path_data / dataset_name
 
         self.tokenizer_path = self.tokenizer_path_ / f'{self.tokenizer_name}-{self.tokenizer_version}'
 

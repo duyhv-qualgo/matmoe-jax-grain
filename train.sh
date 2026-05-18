@@ -1,1 +1,1 @@
-CUDA_VISIBLE_DEVICES=0,1 python train_kl_k.py
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1,2} python train_kl_k.py

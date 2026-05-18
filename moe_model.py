@@ -123,7 +123,7 @@ class MoELayer(nnx.Module):
         self.router = nnx.Linear(d_model + semantic_dim, num_experts, use_bias=False, dtype=jnp.float32,
                                  param_dtype=jnp.float32, rngs=rngs)
 
-        self.experts = nnx.List([Expert(d_model, mlp_dim, dropout_rate, dtype, rngs) for _ in range(num_experts)])
+        self.experts = [Expert(d_model, mlp_dim, dropout_rate, dtype, rngs) for _ in range(num_experts)]
         self.shared_expert = TaskConditionedSharedExpert(d_model, mlp_dim, 2, dropout_rate, dtype, rngs)
 
     def __call__(self, x, direction_ids, current_mlp_dim=None, deterministic: bool = False):
@@ -208,7 +208,7 @@ class DecoderBlock(nnx.Module):
 
 class Encoder(nnx.Module):
     def __init__(self, cfg: MoEModelConfig, rngs: nnx.Rngs):
-        self.blocks = nnx.List([EncoderBlock(cfg, rngs) for _ in range(cfg.num_layers)])
+        self.blocks = [EncoderBlock(cfg, rngs) for _ in range(cfg.num_layers)]
         self.ln_final = nnx.RMSNorm(cfg.d_model, dtype=cfg.dtype, param_dtype=jnp.float32, rngs=rngs)
 
     def __call__(self, x, mask, direction_ids, current_mlp_dim=None, sin=None, cos=None, deterministic=False):
@@ -223,7 +223,7 @@ class Encoder(nnx.Module):
 
 class Decoder(nnx.Module):
     def __init__(self, cfg: MoEModelConfig, rngs: nnx.Rngs):
-        self.blocks = nnx.List([DecoderBlock(cfg, rngs) for _ in range(cfg.num_layers)])
+        self.blocks = [DecoderBlock(cfg, rngs) for _ in range(cfg.num_layers)]
         self.ln_final = nnx.RMSNorm(cfg.d_model, dtype=cfg.dtype, param_dtype=jnp.float32, rngs=rngs)
 
     def __call__(self, x, tgt_mask, enc_out, src_mask, direction_ids, current_mlp_dim=None, sin=None, cos=None, deterministic=False):

@@ -1,0 +1,14 @@
+jax[cuda12]>=0.5.0,<0.6
+flax>=0.10.2
+optax>=0.2.4
+orbax-checkpoint>=0.11.7
+grain>=0.2.16
+msgpack>=1.0.5
+numpy<2.0
+tensorflow-cpu==2.18.0
+transformers>=4.46.0
+datasets>=3.0.0
+sentencepiece
+tokenizers
+sacrebleu>=2.4.0
+tqdm
