@@ -66,29 +66,40 @@ def main():
     print(f"\n{'-' * 60}\n 💾 --- DATA PIPELINE --- \n{'-' * 60}")
     print(f"[\033[94mData\033[0m] Loading HF Arrow splits from base: \033[93m{config.dataset_path}\033[0m")
 
-    hf_train = load_from_disk(config.dataset_path.as_posix() + "_train").with_format("numpy")
-    train_ds = (
-        grain.MapDataset.source(hf_train)
-            .seed(config.seed)
-            .shuffle()
-            .repeat()
-            .batch(config.batch_size * grad_accum_steps, drop_remainder=True)
-            .to_iter_dataset(grain.ReadOptions(num_threads=16, prefetch_buffer_size=8))
-            .mp_prefetch(grain.MultiprocessingOptions(num_workers=2))
-    )
+    loader_kind = os.environ.get("LOADER_KIND", "grain").lower()
+    print(f"[\033[94mData\033[0m] LOADER_KIND=\033[93m{loader_kind}\033[0m")
 
-    def make_eval_ds(base_path: str, batch_size: int):
-        hf = load_from_disk(base_path).with_format("numpy")
-        return (grain.MapDataset.source(hf)
-                  .batch(batch_size, drop_remainder=False)
-                  .to_iter_dataset(grain.ReadOptions(num_threads=4, prefetch_buffer_size=4)))
+    if loader_kind == "tf":
+        import data_tf
+        ds_iter = data_tf.build_train_iter(config, grad_accum_steps)
+        eval_ds_en_vi = data_tf.build_eval_iter(config.tfds_path.as_posix() + "_validation_en_vi", config.eval_batch_size)
+        eval_ds_vi_en = data_tf.build_eval_iter(config.tfds_path.as_posix() + "_validation_vi_en", config.eval_batch_size)
+        test_ds_en_vi = data_tf.build_eval_iter(config.tfds_path.as_posix() + "_test_en_vi", config.test_batch_size)
+        test_ds_vi_en = data_tf.build_eval_iter(config.tfds_path.as_posix() + "_test_vi_en", config.test_batch_size)
+    else:
+        hf_train = load_from_disk(config.dataset_path.as_posix() + "_train").with_format("numpy")
+        train_ds = (
+            grain.MapDataset.source(hf_train)
+                .seed(config.seed)
+                .shuffle()
+                .repeat()
+                .batch(config.batch_size * grad_accum_steps, drop_remainder=True)
+                .to_iter_dataset(grain.ReadOptions(num_threads=16, prefetch_buffer_size=8))
+                .mp_prefetch(grain.MultiprocessingOptions(num_workers=2))
+        )
 
-    eval_ds_en_vi = make_eval_ds(config.dataset_path.as_posix() + "_validation_en_vi", config.eval_batch_size)
-    eval_ds_vi_en = make_eval_ds(config.dataset_path.as_posix() + "_validation_vi_en", config.eval_batch_size)
-    test_ds_en_vi = make_eval_ds(config.dataset_path.as_posix() + "_test_en_vi", config.test_batch_size)
-    test_ds_vi_en = make_eval_ds(config.dataset_path.as_posix() + "_test_vi_en", config.test_batch_size)
+        def make_eval_ds(base_path: str, batch_size: int):
+            hf = load_from_disk(base_path).with_format("numpy")
+            return (grain.MapDataset.source(hf)
+                      .batch(batch_size, drop_remainder=False)
+                      .to_iter_dataset(grain.ReadOptions(num_threads=4, prefetch_buffer_size=4)))
 
-    ds_iter = iter(train_ds)
+        eval_ds_en_vi = make_eval_ds(config.dataset_path.as_posix() + "_validation_en_vi", config.eval_batch_size)
+        eval_ds_vi_en = make_eval_ds(config.dataset_path.as_posix() + "_validation_vi_en", config.eval_batch_size)
+        test_ds_en_vi = make_eval_ds(config.dataset_path.as_posix() + "_test_en_vi", config.test_batch_size)
+        test_ds_vi_en = make_eval_ds(config.dataset_path.as_posix() + "_test_vi_en", config.test_batch_size)
+
+        ds_iter = iter(train_ds)
 
     def to_macro(arr):
         # [B*G, S] -> [G, B, S]
@@ -171,14 +182,17 @@ def main():
     if global_step > 0:
         print(f"\n💾 [\033[93mCheckpoint\033[0m] Restoring from Update Step \033[92m{global_step}\033[0m...")
 
-        data_ckpt_path = config.checkpoint_path / f"data_iter_{global_step}.msgpack"
-        if data_ckpt_path.exists():
-            with open(data_ckpt_path, "rb") as f:
-                ds_iter.set_state(msgpack.unpackb(f.read(), raw=False))
-            ds_iter.start_prefetch()
-            print(f"💾 [\033[93mData\033[0m] Resumed iterator from {data_ckpt_path.name}")
+        if loader_kind != "tf":
+            data_ckpt_path = config.checkpoint_path / f"data_iter_{global_step}.msgpack"
+            if data_ckpt_path.exists():
+                with open(data_ckpt_path, "rb") as f:
+                    ds_iter.set_state(msgpack.unpackb(f.read(), raw=False))
+                ds_iter.start_prefetch()
+                print(f"💾 [\033[93mData\033[0m] Resumed iterator from {data_ckpt_path.name}")
+            else:
+                print(f"⚠️  No data_iter_{global_step}.msgpack — iterator restarts fresh")
         else:
-            print(f"⚠️  No data_iter_{global_step}.msgpack — iterator restarts fresh")
+            print(f"⚠️  [tf loader] iterator restarts fresh on resume")
 
         _, abstract_model_state = nnx.split(model)
         _, abstract_opt_state = nnx.split(optimizer)
@@ -423,7 +437,7 @@ def main():
      bench_t_data = 0.0
      bench_t_h2d = 0.0
      bench_t_step = 0.0
-     dataloader_name = "grain"
+     dataloader_name = loader_kind
      with tqdm(total=config.total_training_steps, initial=global_step, desc="MatMoE Training (Updates)", unit="upd") as pbar:
         while global_step < config.total_training_steps:
 
@@ -804,9 +818,10 @@ def main():
                 _, o_st = nnx.split(optimizer)
                 ckpt_manager.save(global_step, args=ocp.args.StandardSave({'model': m_st, 'opt': o_st}))
 
-                data_ckpt_path = config.checkpoint_path / f"data_iter_{global_step}.msgpack"
-                with open(data_ckpt_path, "wb") as f:
-                    f.write(msgpack.packb(ds_iter.get_state(), use_bin_type=True))
+                if loader_kind != "tf":
+                    data_ckpt_path = config.checkpoint_path / f"data_iter_{global_step}.msgpack"
+                    with open(data_ckpt_path, "wb") as f:
+                        f.write(msgpack.packb(ds_iter.get_state(), use_bin_type=True))
 
             if global_step % config.model_save_interval == 0:
                 _, model_params, _ = nnx.split(model, nnx.Param, ...)
