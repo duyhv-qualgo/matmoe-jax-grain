@@ -51,9 +51,9 @@ class Config:
     # 🌟 HARDWARE SCALE UP
     # =======================================================
     num_accelerator: int = 2  # 🚀 Upgraded to 8 GPUs
-    batch_size: int = 2 ** 6
-    eval_batch_size: int = 2 ** 10
-    test_batch_size: int = 2 ** 10
+    batch_size: int = 2 ** 7
+    eval_batch_size: int = 2 ** 7
+    test_batch_size: int = 2 ** 7
     grad_accum_steps: int = 4
 
     total_training_steps: int = 1_000_000
