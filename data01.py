@@ -7,9 +7,35 @@ from functools import partial
 
 sys.path.extend(['/mnt/data/edw_2'])
 
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+import tensorflow as tf
+# Disable GPU so TF doesn't grab memory JAX will need later.
+tf.config.set_visible_devices([], 'GPU')
+
 from datasets import DatasetDict, Sequence, Value, concatenate_datasets, load_dataset
 from transformers import AutoTokenizer
 from config import config
+
+
+def _cast_dtypes_tf(features):
+    features["input_ids"] = tf.cast(features["input_ids"], tf.int32)
+    features["attention_mask"] = tf.cast(features["attention_mask"], tf.int32)
+    features["labels"] = tf.cast(features["labels"], tf.int32)
+    return features
+
+
+def _save_tfds(hf_ds, save_path: str, *, batch_size: int, shuffle: bool, drop_remainder: bool):
+    """Mirror reference data01.py TFDS recipe: to_tf_dataset → cast_dtypes → save."""
+    tfds = hf_ds.to_tf_dataset(
+        columns=["input_ids", "attention_mask", "labels"],
+        shuffle=shuffle,
+        batch_size=batch_size,
+        drop_remainder=drop_remainder,
+        num_workers=32,
+    )
+    tfds = tfds.map(_cast_dtypes_tf, num_parallel_calls=tf.data.AUTOTUNE)
+    print(f"💾 Saving TFDS to {save_path}")
+    tfds.save(save_path)
 
 
 def preprocess_function_translation(examples, max_length_input, max_length_labels, tokenizer,
@@ -114,6 +140,14 @@ def main():
                 print(f"💾 Saving {split_name.upper()} ({suffix.upper()}) HF Arrow to {save_path}")
                 single_direction_ds.save_to_disk(save_path)
 
+                # Also save TFDS shard for the TF dataloader benchmark path.
+                tfds_save = f"{config.tfds_path.as_posix()}_{split_name}_{suffix}"
+                _save_tfds(
+                    single_direction_ds, tfds_save,
+                    batch_size=config.eval_batch_size,
+                    shuffle=False, drop_remainder=False,
+                )
+
         else:
             # Training set: one row = one example. Grain shuffles/batches at runtime.
             merged_dataset = concatenate_datasets(list(combined.values()))
@@ -127,6 +161,15 @@ def main():
             save_path = f"{config.dataset_path.as_posix()}_{split_name}"
             print(f"💾 Saving {split_name.upper()} HF Arrow to {save_path}")
             merged_dataset.save_to_disk(save_path)
+
+            # Also save TFDS shard for the TF dataloader benchmark path
+            # (pre-batched at compress_batch, matching reference data01.py).
+            tfds_save = f"{config.tfds_path.as_posix()}_{split_name}"
+            _save_tfds(
+                merged_dataset, tfds_save,
+                batch_size=config.compress_batch,
+                shuffle=True, drop_remainder=True,
+            )
 
     print("\n✅ Benchmark Data preprocessing complete!")
 
